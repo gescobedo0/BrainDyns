@@ -59,6 +59,21 @@ __all__ = [
     "map_field_smoothness",
     "edge_cluster_separation",
     "save_scalp_animation",
+    "schaefer_network_table",
+    "moran_i",
+    "infer_schaefer_order",
+    "undirected_edges",
+    "surrogate_windows",
+    "edge_map_summary",
+    "residualize",
+    "distance_covariates",
+    "network_permutation_test",
+    "network_pair_matrix",
+    "group_variance_explained",
+    "edge_pair_variance_test",
+    "embedding_cluster_stats",
+    "consensus_embedding",
+    "node_map_signature",
 ]
 
 
@@ -1420,3 +1435,443 @@ def save_scalp_animation(
         anim.save(wrote, writer=manim.PillowWriter(fps=fps), dpi=dpi)
     plt.close(fig)
     return wrote
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Yeo-network organization of the map field (fMRI)
+# ─────────────────────────────────────────────────────────────────────────────
+def schaefer_network_table(
+    n_rois: int = 400, data_order: int = 17, data_dir: Optional[str] = None
+) -> dict:
+    """Per-node Yeo-7 and Yeo-17 labels and MNI centroids, in ``data_order`` numbering.
+
+    The 7- and 17-network Schaefer atlases hold the same parcels numbered differently, so
+    a node index only names a parcel once the numbering is known. RBC timeseries are
+    ``atlas-Schaefer2018p400n17``: use ``data_order=17`` (``infer_schaefer_order`` checks
+    this from a checkpoint). The crosswalk is computed from voxel overlap and must be 1:1.
+    """
+    import nibabel as nib
+    from pathlib import Path
+    from nilearn import datasets
+
+    vols, names, affine = {}, {}, None
+    for n_net in (7, 17):
+        atlas = datasets.fetch_atlas_schaefer_2018(
+            n_rois=n_rois, yeo_networks=n_net, resolution_mm=2,
+            data_dir=data_dir, verbose=0,
+        )
+        img = nib.load(atlas.maps)
+        vols[n_net] = np.asarray(img.dataobj).astype(np.int64)
+        affine = img.affine
+        order_txt = Path(atlas.maps).with_name(
+            f"Schaefer2018_{n_rois}Parcels_{n_net}Networks_order.txt"
+        )
+        names[n_net] = [
+            line.split("\t")[1] for line in order_txt.read_text().splitlines() if line
+        ]
+
+    overlap = np.zeros((n_rois + 1, n_rois + 1), dtype=np.int64)
+    np.add.at(overlap, (vols[7].ravel(), vols[17].ravel()), 1)
+    overlap = overlap[1:, 1:]
+    to7 = overlap.argmax(0)  # 17-network parcel index -> 7-network parcel index
+    purity = overlap.max(0) / np.maximum(overlap.sum(0), 1)
+    if len(set(to7.tolist())) != n_rois or purity.min() < 0.99:
+        raise RuntimeError(
+            "Schaefer 7/17-network parcels do not map 1:1 "
+            f"(min voxel purity {purity.min():.3f})."
+        )
+    to17 = np.empty(n_rois, dtype=np.int64)
+    to17[to7] = np.arange(n_rois)
+
+    cent7 = np.stack(
+        [
+            nib.affines.apply_affine(affine, np.argwhere(vols[7] == i + 1).mean(0))
+            for i in range(n_rois)
+        ]
+    )
+    # Every field below is first built in 17-network numbering.
+    yeo17 = np.array([s.split("_")[2] for s in names[17]])
+    hemi = np.array([s.split("_")[1] for s in names[17]])
+    yeo7 = np.array([names[7][i].split("_")[2] for i in to7])
+    cent = cent7[to7]
+    if data_order == 17:
+        perm = np.arange(n_rois)
+    elif data_order == 7:
+        perm = to17
+    else:
+        raise ValueError(f"data_order must be 7 or 17, got {data_order}")
+    return {
+        "yeo7": yeo7[perm],
+        "yeo17": yeo17[perm],
+        "hemi": hemi[perm],
+        "centroids": cent[perm],
+        "data_order": data_order,
+    }
+
+
+def moran_i(values: np.ndarray, edge_index: np.ndarray) -> float:
+    """Moran's I of a node field on a graph: spatial autocorrelation, ~0 when unrelated."""
+    z = np.asarray(values, dtype=np.float64)
+    z = z - z.mean()
+    e = np.asarray(edge_index)
+    return float(len(z) / e.shape[1] * (z[e[0]] * z[e[1]]).sum() / (z * z).sum())
+
+
+def infer_schaefer_order(parcel_values: np.ndarray, k: int = 8) -> dict:
+    """Which Schaefer numbering are the data columns in?
+
+    Per-parcel BOLD statistics (``ckpt["norm_stats"]["std"]``) vary smoothly over cortex
+    only under the numbering the columns really use, so the larger Moran's I on each
+    order's own k-nearest-neighbor centroid graph identifies it.
+    """
+    from model.graph_builders import build_spatial_graph_from_positions
+
+    x = np.log(np.asarray(parcel_values, dtype=np.float64).ravel())
+    out = {}
+    for order in (7, 17):
+        pos = schaefer_network_table(n_rois=len(x), data_order=order)["centroids"]
+        ei, _, _ = build_spatial_graph_from_positions(pos, k=k)
+        out[order] = moran_i(x, ei.numpy())
+    out["order"] = 17 if out[17] > out[7] else 7
+    return out
+
+
+def undirected_edges(edge_index: np.ndarray) -> dict:
+    """Collapse directed edges to unordered pairs.
+
+    ``rho_dst`` on (j, i) has exactly the inputs of ``rho_src`` on (i, j), so a symmetric
+    ``edge_index`` lists every map twice. Testing on directed edges would count each
+    observation twice. ``collapse(values)`` averages a per-directed-edge value per pair.
+    """
+    e = np.asarray(edge_index)
+    lo, hi = np.minimum(e[0], e[1]), np.maximum(e[0], e[1])
+    pairs, inverse = np.unique(np.stack([lo, hi], 1), axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    count = np.bincount(inverse, minlength=len(pairs))
+
+    def collapse(values: np.ndarray) -> np.ndarray:
+        return np.bincount(inverse, weights=values, minlength=len(pairs)) / count
+
+    return {"u": pairs[:, 0], "v": pairs[:, 1], "collapse": collapse}
+
+
+def surrogate_windows(
+    n_batches: int, batch_size: int, n_nodes: int, window: int,
+    phi: float = 0.5, seed: int = 0,
+):
+    """Yield unit-variance AR(1) ``x_history`` batches, statistically identical at every node.
+
+    With no node-specific signal in the input, any persistent edge structure in the maps
+    comes from the learned parameters (the map PE). Not a substitute for real BOLD: it
+    says nothing about the signal-driven part of the maps.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    scale = float(np.sqrt(1.0 - phi**2))
+    for _ in range(n_batches):
+        eps = torch.randn(batch_size, n_nodes, window, 1, generator=gen)
+        x = torch.empty_like(eps)
+        x[:, :, 0] = eps[:, :, 0]
+        for t in range(1, window):
+            x[:, :, t] = phi * x[:, :, t - 1] + scale * eps[:, :, t]
+        yield x
+
+
+def edge_map_summary(
+    model: BrainDyn,
+    batches: Any,
+    edge_index: torch.Tensor,
+    keep_per_batch: int = 4,
+    seed: int = 0,
+) -> dict:
+    """Stream ``x_history`` batches into per-edge summaries without holding every map.
+
+    ``split_half_norm`` / ``split_half_map`` correlate the two halves of the batches.
+    Near zero means the per-edge means are sampling noise and carry no edge identity,
+    so nothing downstream can be read as structure. ``samples`` keeps a few window-level
+    maps for Fig 5-style clouds.
+    """
+    rng = np.random.default_rng(seed)
+    E = int(edge_index.shape[1])
+    map_sum, norm_sum, n_win = [0.0, 0.0], [0.0, 0.0], [0, 0]
+    align_sum, samples = 0.0, []
+    for b, x_history in enumerate(batches):
+        h = harvest_maps(model, x_history, edge_index)
+        B = h["rho_src"].shape[0]
+        rs = h["rho_src"].reshape(B, E, -1).astype(np.float64)
+        rd = h["rho_dst"].reshape(B, E, -1).astype(np.float64)
+        ns, nd = np.linalg.norm(rs, axis=-1), np.linalg.norm(rd, axis=-1)
+        half = b % 2
+        map_sum[half] = map_sum[half] + rs.sum(0)
+        norm_sum[half] = norm_sum[half] + (0.5 * (ns + nd)).sum(0)
+        n_win[half] += B
+        align_sum = align_sum + ((rs * rd).sum(-1) / (ns * nd + 1e-12)).sum(0)
+        pick = rng.choice(B, size=min(keep_per_batch, B), replace=False)
+        samples.append(rs[pick].astype(np.float32))
+    if min(n_win) == 0:
+        raise ValueError("edge_map_summary needs at least two batches for split-half.")
+
+    means = [map_sum[i] / n_win[i] for i in (0, 1)]
+    a, c = means[0] - means[0].mean(0), means[1] - means[1].mean(0)
+    n_total = sum(n_win)
+    return {
+        "norm": (norm_sum[0] + norm_sum[1]) / n_total,
+        "align": align_sum / n_total,
+        "mean_map": (map_sum[0] + map_sum[1]) / n_total,
+        "samples": np.concatenate(samples, 0),
+        "split_half_norm": float(
+            np.corrcoef(norm_sum[0] / n_win[0], norm_sum[1] / n_win[1])[0, 1]
+        ),
+        "split_half_map": float((a * c).sum() / np.sqrt((a * a).sum() * (c * c).sum())),
+        "n_windows": n_total,
+    }
+
+
+def residualize(Y: np.ndarray, Z: Optional[np.ndarray]) -> np.ndarray:
+    """Remove the least-squares fit of covariates ``Z`` (plus intercept) from ``Y``."""
+    Y = np.asarray(Y, dtype=np.float64)
+    if Z is None:
+        return Y
+    A = np.c_[np.ones(len(Y)), np.asarray(Z, dtype=np.float64)]
+    return Y - A @ np.linalg.lstsq(A, Y, rcond=None)[0]
+
+
+def distance_covariates(centroids: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Edge covariates ``[log d, log^2 d]``: within-network edges are physically shorter."""
+    ld = np.log(np.linalg.norm(centroids[u] - centroids[v], axis=1) + 1e-6)
+    return np.c_[ld, ld**2]
+
+
+def _spatial_modes(centroids: np.ndarray, length_mm: float = 20.0) -> np.ndarray:
+    """Orthonormal spatial eigenmodes of the parcels, from a Gaussian proximity kernel."""
+    d2 = ((centroids[:, None, :] - centroids[None, :, :]) ** 2).sum(-1)
+    return np.linalg.eigh(np.exp(-d2 / (2.0 * length_mm**2)))[1]
+
+
+def _spatial_surrogate(A: np.ndarray, modes: np.ndarray, rng: Any) -> np.ndarray:
+    """Moran spectral randomization: random sign per eigenmode.
+
+    Keeps the spatial spectrum, so the surrogate is as smooth as ``A``, while breaking its
+    alignment with any particular labelling. Yeo networks are spatially contiguous, so
+    permuting labels instead makes any smooth field look network-like (kNN and k-means
+    tests were 100% "significant" on smooth random fields).
+    """
+    signs = rng.choice([-1.0, 1.0], size=(modes.shape[1], 1))
+    return (modes @ (signs * (modes.T @ A.reshape(len(A), -1)))).reshape(A.shape)
+
+
+def _edge_surrogates(
+    Y: np.ndarray,
+    src: np.ndarray,
+    dst: np.ndarray,
+    centroids: np.ndarray,
+    n_perm: int,
+    seed: int,
+    directed: bool,
+):
+    """Yield surrogate edge data with labels and graph left untouched.
+
+    ``Y`` is split into additive node effects plus an edge residual. Node effects get a
+    spatial surrogate and residuals are shuffled across edges. Keeping labels fixed
+    matters because the graph can be aligned with them: true labels then give few,
+    concentrated network pairs where permuted labels give many diffuse ones, and plain
+    node-to-node variation looks like network structure.
+    """
+    N, E = len(centroids), len(src)
+    rows = np.arange(E)
+    design = np.zeros((E, 2 * N if directed else N))
+    design[rows, src] = 1.0
+    design[rows, (N + dst) if directed else dst] = 1.0
+    effects = np.linalg.lstsq(design, Y, rcond=None)[0]
+    resid = Y - design @ effects
+    modes = _spatial_modes(centroids)
+    rng = np.random.default_rng(seed)
+    for _ in range(n_perm):
+        if directed:
+            from_src = _spatial_surrogate(effects[:N], modes, rng)
+            to_dst = _spatial_surrogate(effects[N:], modes, rng)
+            yield from_src[src] + to_dst[dst] + resid[rng.permutation(E)]
+        else:
+            node = _spatial_surrogate(effects, modes, rng)
+            yield node[src] + node[dst] + resid[rng.permutation(E)]
+
+
+def network_permutation_test(
+    values: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    covariates: Optional[np.ndarray] = None,
+    n_perm: int = 1000,
+    seed: int = 0,
+) -> dict:
+    """Within- minus between-network mean of an edge value, against a spatial null.
+
+    ``d`` is the difference in SD units of the (residualized) values. See
+    ``_edge_surrogates`` for the null.
+    """
+    y = residualize(values, covariates)
+    y = y - y.mean()
+    labels = np.asarray(labels)
+    within = labels[u] == labels[v]
+
+    def diff(val):
+        return val[within].mean() - val[~within].mean()
+
+    obs = diff(y)
+    null = np.array(
+        [diff(s) for s in _edge_surrogates(y, u, v, centroids, n_perm, seed, directed=False)]
+    )
+    centered = np.abs(null - null.mean())
+    return {
+        "d": float(obs / y.std()),
+        "z": float((obs - null.mean()) / null.std()),
+        "p": float((1 + (centered >= abs(obs - null.mean())).sum()) / (n_perm + 1)),
+        "n_within": int(within.sum()),
+        "n_between": int((~within).sum()),
+    }
+
+
+def network_pair_matrix(
+    values: np.ndarray, u: np.ndarray, v: np.ndarray, labels: np.ndarray, names: list
+) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetric K x K mean of an edge value per network pair, plus the edge counts."""
+    idx = {g: i for i, g in enumerate(names)}
+    a = np.array([idx[g] for g in np.asarray(labels)[u]])
+    b = np.array([idx[g] for g in np.asarray(labels)[v]])
+    total, count = np.zeros((len(names),) * 2), np.zeros((len(names),) * 2)
+    np.add.at(total, (a, b), values)
+    np.add.at(count, (a, b), 1)
+    off = a != b
+    np.add.at(total, (b[off], a[off]), values[off])
+    np.add.at(count, (b[off], a[off]), 1)
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan), count
+
+
+def group_variance_explained(X: np.ndarray, groups: np.ndarray) -> float:
+    """Fraction of total variance in ``X`` held by group centroids (PERMANOVA-style R^2)."""
+    X = np.asarray(X, dtype=np.float64)
+    X = X - X.mean(0)
+    _, inv = np.unique(groups, return_inverse=True)
+    inv = inv.ravel()
+    sums = np.zeros((inv.max() + 1, X.shape[1]))
+    np.add.at(sums, inv, X)
+    return float(((sums**2).sum(1) / np.bincount(inv)).sum() / (X**2).sum())
+
+
+def _null_summary(obs: float, null: np.ndarray) -> dict:
+    return {
+        "value": float(obs),
+        "null_mean": float(null.mean()),
+        "z": float((obs - null.mean()) / (null.std() + 1e-12)),
+        "p": float((1 + (null >= obs).sum()) / (len(null) + 1)),
+    }
+
+
+def edge_pair_variance_test(
+    X: np.ndarray,
+    src: np.ndarray,
+    dst: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    covariates: Optional[np.ndarray] = None,
+    n_perm: int = 500,
+    seed: int = 0,
+) -> dict:
+    """Do edge embeddings separate by network pair? R^2 against a spatial null.
+
+    See ``_edge_surrogates`` for the null. Permuting labels here gave 82% false positives
+    on random node effects on the Schaefer graph.
+    """
+    Xr = residualize(X, covariates)
+    Xr = Xr - Xr.mean(0)
+    _, code = np.unique(labels, return_inverse=True)
+    code = code.ravel()
+    K = int(code.max()) + 1
+    groups = np.minimum(code[src], code[dst]) * K + np.maximum(code[src], code[dst])
+    obs = group_variance_explained(Xr, groups)
+    null = np.array(
+        [
+            group_variance_explained(s, groups)
+            for s in _edge_surrogates(Xr, src, dst, centroids, n_perm, seed, directed=True)
+        ]
+    )
+    return _null_summary(obs, null)
+
+
+def embedding_cluster_stats(
+    X: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    n_perm: int = 300,
+    n_neighbors: int = 10,
+    seed: int = 0,
+) -> dict:
+    """Do node embeddings cluster by network? Scored in the full space, not a 2-D view.
+
+    Silhouette and leave-one-out kNN accuracy ask whether labelled networks separate.
+    K-means ARI asks whether *unsupervised* clusters recover them. Each is compared with
+    the same score on spatial surrogates of the embedding, so a result means structure
+    beyond what spatial smoothness alone gives. ``value`` is the effect size; with a tight
+    null a large z can still sit on a negligible value.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_rand_score, pairwise_distances, silhouette_score
+
+    _, code = np.unique(np.asarray(labels), return_inverse=True)
+    code = code.ravel()
+    K = int(code.max()) + 1
+
+    def scores(Y, n_init):
+        D = pairwise_distances(Y)
+        np.fill_diagonal(D, np.inf)
+        votes = (code[np.argsort(D, axis=1)[:, :n_neighbors]][:, :, None] == np.arange(K)).sum(1)
+        np.fill_diagonal(D, 0.0)
+        clusters = KMeans(n_clusters=K, n_init=n_init, random_state=seed).fit_predict(Y)
+        return (
+            float(silhouette_score(D, code, metric="precomputed")),
+            float((votes.argmax(1) == code).mean()),
+            float(adjusted_rand_score(code, clusters)),
+        )
+
+    Xc = np.asarray(X, dtype=np.float64)
+    Xc = Xc - Xc.mean(0)
+    obs = scores(Xc, n_init=10)
+    modes = _spatial_modes(centroids)
+    rng = np.random.default_rng(seed)
+    null = np.array([scores(_spatial_surrogate(Xc, modes, rng), 3) for _ in range(n_perm)])
+    return {
+        name: _null_summary(obs[i], null[:, i])
+        for i, name in enumerate(("silhouette", "knn_acc", "kmeans_ari"))
+    }
+
+
+def consensus_embedding(embeddings: list, n_components: int = 8) -> dict:
+    """Combine runs whose embeddings differ by an arbitrary rotation and scale.
+
+    Coordinates cannot be averaged across runs, but pairwise distances can. Distances are
+    scaled to unit mean per run, averaged, and embedded by classical MDS. ``reliability``
+    is the mean cross-run correlation of distances: ~0 means the runs share no geometry.
+    """
+    from scipy.spatial.distance import pdist, squareform
+
+    d = np.stack([pdist(np.asarray(e, dtype=np.float64)) for e in embeddings])
+    d = d / d.mean(1, keepdims=True)
+    iu = np.triu_indices(len(d), 1)
+    reliability = float(np.corrcoef(d)[iu].mean()) if len(d) > 1 else float("nan")
+    D2 = squareform(d.mean(0)) ** 2
+    n = len(D2)
+    J = np.eye(n) - 1.0 / n
+    w, V = np.linalg.eigh(-0.5 * J @ D2 @ J)
+    top = np.argsort(w)[::-1][:n_components]
+    return {
+        "coords": V[:, top] * np.sqrt(np.maximum(w[top], 0.0)),
+        "reliability": reliability,
+    }
+
+
+def node_map_signature(mean_map: np.ndarray, src: np.ndarray, n_nodes: int) -> np.ndarray:
+    """Mean outgoing map per node: an embedding of how a node restricts onto its edges."""
+    out = np.zeros((n_nodes, mean_map.shape[1]))
+    np.add.at(out, src, mean_map)
+    return out / np.maximum(np.bincount(src, minlength=n_nodes), 1)[:, None]

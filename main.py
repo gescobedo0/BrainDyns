@@ -1883,7 +1883,7 @@ def parse_args():
         help="Optional node-positions JSON for --graph_mode spatial. Default for "
         "lemon_eeg: montage_positions.json beside the .npy derivatives, else MNE "
         "fallback. Default for fmri: "
-        "data/atlases/schaefer400_7networks/centroids.json (see "
+        "data/atlases/schaefer400_17networks/centroids.json (see "
         "scripts/build_schaefer_centroids.py).",
     )
     ap.add_argument(

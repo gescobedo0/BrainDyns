@@ -8,7 +8,7 @@ The raw source data (PNC imaging, raw LEMON EEG recordings) lives on the shared 
 
 ## PNC fMRI
 
-Philadelphia Neurodevelopmental Cohort resting-state fMRI, drawn from the RBC (ReproBrainChart) PNC+HBN release, parcellated into 400 ROIs with the Schaefer-400 / 7-Networks atlas via the CPAC pipeline.
+Philadelphia Neurodevelopmental Cohort resting-state fMRI, drawn from the RBC (ReproBrainChart) PNC+HBN release, parcellated into 400 ROIs with the Schaefer-400 / 17-Networks atlas (`atlas-Schaefer2018p400n17`) via the CPAC pipeline.
 
 ### Manifest
 

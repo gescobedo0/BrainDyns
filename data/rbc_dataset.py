@@ -70,7 +70,7 @@ NormMode = Literal["train_global"]
 _BETWEEN_SPLITS = frozenset({"train", "val", "test"})
 
 _DEFAULT_SCHAEFER_CENTROIDS_JSON = (
-    Path(__file__).parent / "atlases" / "schaefer400_7networks" / "centroids.json"
+    Path(__file__).parent / "atlases" / "schaefer400_17networks" / "centroids.json"
 )
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,11 @@ def schaefer_centroids(
     ``scripts/build_schaefer_centroids.py``, run once) so training needs no
     nilearn atlas download -- mirrors how ``lemon_dataset.montage_positions``
     reads a cached ``montage_positions.json`` instead of importing MNE.
-    Defaults to ``data/atlases/schaefer400_7networks/centroids.json``.
+    Defaults to ``data/atlases/schaefer400_17networks/centroids.json``.
+
+    The order must match the data columns, which are ``atlas-Schaefer2018p400n17``.
+    Files not marked as 17-network are rejected, since the 7-network atlas numbers the
+    same parcels differently and would silently connect the wrong ones.
     """
     p = Path(positions_json) if positions_json is not None else _DEFAULT_SCHAEFER_CENTROIDS_JSON
     if not p.exists():
@@ -108,6 +112,11 @@ def schaefer_centroids(
             "scripts/build_schaefer_centroids.py once to generate it."
         )
     payload = json.loads(p.read_text())
+    if payload.get("yeo_networks") != 17:
+        raise ValueError(
+            f"{p} is not marked as Schaefer 17-network order, which the fMRI data "
+            "columns use. Regenerate it with scripts/build_schaefer_centroids.py."
+        )
     centroids = np.asarray(payload["centroids"], dtype=np.float64)
     if centroids.shape != (expected_nodes, 3):
         raise ValueError(
