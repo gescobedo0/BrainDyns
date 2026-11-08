@@ -63,7 +63,6 @@ __all__ = [
     "moran_i",
     "infer_schaefer_order",
     "undirected_edges",
-    "surrogate_windows",
     "edge_map_summary",
     "residualize",
     "distance_covariates",
@@ -72,7 +71,6 @@ __all__ = [
     "group_variance_explained",
     "edge_pair_variance_test",
     "embedding_cluster_stats",
-    "consensus_embedding",
     "node_map_signature",
 ]
 
@@ -1555,74 +1553,50 @@ def undirected_edges(edge_index: np.ndarray) -> dict:
     return {"u": pairs[:, 0], "v": pairs[:, 1], "collapse": collapse}
 
 
-def surrogate_windows(
-    n_batches: int, batch_size: int, n_nodes: int, window: int,
-    phi: float = 0.5, seed: int = 0,
-):
-    """Yield unit-variance AR(1) ``x_history`` batches, statistically identical at every node.
-
-    With no node-specific signal in the input, any persistent edge structure in the maps
-    comes from the learned parameters (the map PE). Not a substitute for real BOLD: it
-    says nothing about the signal-driven part of the maps.
-    """
-    gen = torch.Generator().manual_seed(seed)
-    scale = float(np.sqrt(1.0 - phi**2))
-    for _ in range(n_batches):
-        eps = torch.randn(batch_size, n_nodes, window, 1, generator=gen)
-        x = torch.empty_like(eps)
-        x[:, :, 0] = eps[:, :, 0]
-        for t in range(1, window):
-            x[:, :, t] = phi * x[:, :, t - 1] + scale * eps[:, :, t]
-        yield x
-
-
 def edge_map_summary(
-    model: BrainDyn,
-    batches: Any,
-    edge_index: torch.Tensor,
-    keep_per_batch: int = 4,
+    rho_src: np.ndarray,
+    rho_dst: np.ndarray,
+    n_samples: int = 32,
+    chunk: int = 32,
     seed: int = 0,
 ) -> dict:
-    """Stream ``x_history`` batches into per-edge summaries without holding every map.
+    """Per-edge summaries of a harvested map population ``(S, E, H, De)``.
 
-    ``split_half_norm`` / ``split_half_map`` correlate the two halves of the batches.
-    Near zero means the per-edge means are sampling noise and carry no edge identity,
-    so nothing downstream can be read as structure. ``samples`` keeps a few window-level
-    maps for Fig 5-style clouds.
+    ``split_half_norm`` / ``split_half_map`` correlate per-edge means over even vs odd
+    windows. Near zero means the per-edge means are sampling noise and carry no edge
+    identity, so nothing downstream can be read as structure. ``samples`` keeps a few
+    window-level maps for Fig 5-style clouds. Works in window chunks to bound memory.
     """
-    rng = np.random.default_rng(seed)
-    E = int(edge_index.shape[1])
+    S, E = rho_src.shape[:2]
+    if S < 2:
+        raise ValueError("edge_map_summary needs at least two windows for split-half.")
     map_sum, norm_sum, n_win = [0.0, 0.0], [0.0, 0.0], [0, 0]
-    align_sum, samples = 0.0, []
-    for b, x_history in enumerate(batches):
-        h = harvest_maps(model, x_history, edge_index)
-        B = h["rho_src"].shape[0]
-        rs = h["rho_src"].reshape(B, E, -1).astype(np.float64)
-        rd = h["rho_dst"].reshape(B, E, -1).astype(np.float64)
+    align_sum = 0.0
+    for start in range(0, S, chunk):
+        rs = np.asarray(rho_src[start : start + chunk], dtype=np.float64).reshape(-1, E, rho_src.shape[2] * rho_src.shape[3])
+        rd = np.asarray(rho_dst[start : start + chunk], dtype=np.float64).reshape(rs.shape)
         ns, nd = np.linalg.norm(rs, axis=-1), np.linalg.norm(rd, axis=-1)
-        half = b % 2
-        map_sum[half] = map_sum[half] + rs.sum(0)
-        norm_sum[half] = norm_sum[half] + (0.5 * (ns + nd)).sum(0)
-        n_win[half] += B
         align_sum = align_sum + ((rs * rd).sum(-1) / (ns * nd + 1e-12)).sum(0)
-        pick = rng.choice(B, size=min(keep_per_batch, B), replace=False)
-        samples.append(rs[pick].astype(np.float32))
-    if min(n_win) == 0:
-        raise ValueError("edge_map_summary needs at least two batches for split-half.")
+        half = (start + np.arange(len(rs))) % 2
+        for h in (0, 1):
+            sel = half == h
+            map_sum[h] = map_sum[h] + rs[sel].sum(0)
+            norm_sum[h] = norm_sum[h] + (0.5 * (ns[sel] + nd[sel])).sum(0)
+            n_win[h] += int(sel.sum())
 
-    means = [map_sum[i] / n_win[i] for i in (0, 1)]
+    means = [map_sum[h] / n_win[h] for h in (0, 1)]
     a, c = means[0] - means[0].mean(0), means[1] - means[1].mean(0)
-    n_total = sum(n_win)
+    pick = np.sort(np.random.default_rng(seed).choice(S, size=min(n_samples, S), replace=False))
     return {
-        "norm": (norm_sum[0] + norm_sum[1]) / n_total,
-        "align": align_sum / n_total,
-        "mean_map": (map_sum[0] + map_sum[1]) / n_total,
-        "samples": np.concatenate(samples, 0),
+        "norm": (norm_sum[0] + norm_sum[1]) / S,
+        "align": align_sum / S,
+        "mean_map": (map_sum[0] + map_sum[1]) / S,
+        "samples": np.asarray(rho_src[pick], dtype=np.float32).reshape(len(pick), E, -1),
         "split_half_norm": float(
             np.corrcoef(norm_sum[0] / n_win[0], norm_sum[1] / n_win[1])[0, 1]
         ),
         "split_half_map": float((a * c).sum() / np.sqrt((a * a).sum() * (c * c).sum())),
-        "n_windows": n_total,
+        "n_windows": S,
     }
 
 
@@ -1843,30 +1817,6 @@ def embedding_cluster_stats(
     return {
         name: _null_summary(obs[i], null[:, i])
         for i, name in enumerate(("silhouette", "knn_acc", "kmeans_ari"))
-    }
-
-
-def consensus_embedding(embeddings: list, n_components: int = 8) -> dict:
-    """Combine runs whose embeddings differ by an arbitrary rotation and scale.
-
-    Coordinates cannot be averaged across runs, but pairwise distances can. Distances are
-    scaled to unit mean per run, averaged, and embedded by classical MDS. ``reliability``
-    is the mean cross-run correlation of distances: ~0 means the runs share no geometry.
-    """
-    from scipy.spatial.distance import pdist, squareform
-
-    d = np.stack([pdist(np.asarray(e, dtype=np.float64)) for e in embeddings])
-    d = d / d.mean(1, keepdims=True)
-    iu = np.triu_indices(len(d), 1)
-    reliability = float(np.corrcoef(d)[iu].mean()) if len(d) > 1 else float("nan")
-    D2 = squareform(d.mean(0)) ** 2
-    n = len(D2)
-    J = np.eye(n) - 1.0 / n
-    w, V = np.linalg.eigh(-0.5 * J @ D2 @ J)
-    top = np.argsort(w)[::-1][:n_components]
-    return {
-        "coords": V[:, top] * np.sqrt(np.maximum(w[top], 0.0)),
-        "reliability": reliability,
     }
 
 
